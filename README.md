@@ -1,6 +1,6 @@
 # torchmplc
 
-PyTorch-based tools for multi-plane light conversion (MPLC) simulations.
+PyTorch-based tools for designing phase masks for multi-plane light conversion (MPLC).
 
 ## Installation
 
