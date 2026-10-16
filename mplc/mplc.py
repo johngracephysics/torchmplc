@@ -688,6 +688,212 @@ class MPLC(nn.Module):
             )
 
         print(f"Saved {len(phases)} phases to '{folder}'.")
+
+    def import_masks(self, filename, *, atol=1e-4):
+        folder = Path(filename)
+
+        if not folder.exists():
+            raise FileNotFoundError(
+                f"Mask folder '{folder}' does not exist."
+            )
+
+        if not folder.is_dir():
+            raise NotADirectoryError(
+                f"'{folder}' is not a directory."
+            )
+
+        if not (0 < atol < float("inf")):
+            raise ValueError(
+                f"atol must be positive and finite; got {atol}."
+            )
+
+        n_masks = len(self.phase_masks)
+        expected_names = {
+            f"phase_{i + 1}.csv" for i in range(n_masks)
+        }
+        found_names = {
+            path.name for path in folder.glob("*.csv")
+        }
+
+        if len(found_names) != n_masks:
+            raise ValueError(
+                f"Wrong number of mask CSVs in '{folder}': "
+                f"expected {n_masks}, found {len(found_names)}."
+            )
+
+        if found_names != expected_names:
+            raise ValueError(
+                "Incorrect mask filenames. "
+                f"Missing: {sorted(expected_names - found_names)}; "
+                f"unexpected: {sorted(found_names - expected_names)}."
+            )
+
+        new_thetas = []
+        saved_phases = []
+
+        # Load, validate and fit every mask
+        for i, mask in enumerate(self.phase_masks, start=1):
+            path = folder / f"phase_{i}.csv"
+
+            with torch.no_grad():
+                expected_phase = mask.get_theta(self.shape)
+
+            if expected_phase.ndim != 1 or mask.theta.ndim != 1:
+                raise ValueError(
+                    f"Mask {i}: expected 1D phase tensors; "
+                    f"got output shape {tuple(expected_phase.shape)} "
+                    f"and parameter shape {tuple(mask.theta.shape)}."
+                )
+
+            try:
+                data = np.loadtxt(
+                    path, delimiter=",", ndmin=2
+                )
+            except (OSError, ValueError, UnicodeError) as exc:
+                raise ValueError(
+                    f"Mask {i}: cannot read numeric CSV "
+                    f"'{path}': {exc}"
+                ) from exc
+
+            n_samples = expected_phase.numel()
+            n_controls = mask.theta.numel()
+
+            if data.shape != (n_samples, 1):
+                raise ValueError(
+                    f"Mask {i}: wrong CSV shape {data.shape}; "
+                    f"expected ({n_samples}, 1)."
+                )
+
+            if not np.isfinite(data).all():
+                raise ValueError(
+                    f"Mask {i}: CSV contains NaN or infinity."
+                )
+
+            if n_samples < n_controls:
+                raise ValueError(
+                    f"Mask {i}: {n_samples} saved samples cannot "
+                    f"uniquely determine {n_controls} trainable "
+                    "phase values. Export at a field resolution "
+                    "at least as large as the mask resolution."
+                )
+
+            saved = torch.from_numpy(
+                data[:, 0].copy()
+            ).to(torch.float64)
+
+            # Unwrap phases using the same convention as
+            # mplcF.interpolate_phase
+            delta = torch.remainder(
+                saved[1:] - saved[:-1] + torch.pi,
+                2 * torch.pi
+            ) - torch.pi
+
+            unwrapped = torch.cat((
+                saved[:1],
+                saved[:1] + torch.cumsum(delta, dim=0)
+            ))
+
+            # Build the interpolation matrix corresponding
+            # to F.interpolate(..., align_corners=True).
+            x = torch.linspace(
+                0, n_controls - 1, n_samples,
+                dtype=torch.float64
+            )
+
+            left = x.floor().long()
+            right = (left + 1).clamp(max=n_controls - 1)
+            alpha = x - left
+
+            A = torch.zeros(
+                (n_samples, n_controls),
+                dtype=torch.float64
+            )
+
+            rows = torch.arange(n_samples)
+
+            A[rows, left] = 1 - alpha
+            A[rows, right] += alpha
+
+            # Recover control-point phases by least squares
+            fitted_theta = torch.linalg.lstsq(
+                A, unwrapped
+            ).solution
+
+            fitted_theta = fitted_theta.to(
+                device=mask.theta.device,
+                dtype=mask.theta.dtype
+            )
+
+            if not torch.isfinite(fitted_theta).all():
+                raise ValueError(
+                    f"Mask {i}: fitted theta contains "
+                    "non-finite values."
+                )
+
+            new_thetas.append(fitted_theta)
+            saved_phases.append(saved)
+
+        # Back up existing parameters before modifying them
+        original_thetas = [
+            mask.theta.detach().clone()
+            for mask in self.phase_masks
+        ]
+
+        try:
+            with torch.no_grad():
+
+                # Update the existing parameters in-place
+                for mask, theta in zip(
+                    self.phase_masks, new_thetas
+                ):
+                    mask.theta.copy_(theta)
+
+                # Verify reconstruction through get_theta()
+                for i, (mask, target) in enumerate(
+                    zip(self.phase_masks, saved_phases),
+                    start=1
+                ):
+                    reconstructed = (
+                        mask.get_theta(self.shape)
+                        .detach()
+                        .cpu()
+                        .to(torch.float64)
+                    )
+
+                    # Angular difference modulo 2*pi
+                    difference = torch.remainder(
+                        reconstructed - target + torch.pi,
+                        2 * torch.pi
+                    ) - torch.pi
+
+                    error = difference.abs().max().item()
+
+                    if (
+                        not torch.isfinite(reconstructed).all()
+                        or error > atol
+                    ):
+                        raise ValueError(
+                            f"Mask {i}: reconstruction failed. "
+                            f"Maximum phase error = {error:.3e} rad; "
+                            f"allowed = {atol:.3e} rad. "
+                            "The model cannot reproduce this phase "
+                            "profile at its current mask resolution. "
+                            "Original parameters have been restored."
+                        )
+
+        except Exception:
+            # Roll back every mask if verification fails
+            with torch.no_grad():
+                for mask, old_theta in zip(
+                    self.phase_masks, original_thetas
+                ):
+                    mask.theta.copy_(old_theta)
+            raise
+
+        print(
+            f"Imported and verified {n_masks} phase masks "
+            f"from '{folder}'."
+        )
     
         
     
